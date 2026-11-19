@@ -16,36 +16,58 @@
  */
 package org.apache.kafka.streams.state.internals;
 
+import org.apache.kafka.clients.consumer.MockConsumer;
+import org.apache.kafka.clients.consumer.internals.AutoOffsetResetStrategy;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.utils.MockTime;
+import org.apache.kafka.common.utils.internals.LogContext;
 import org.apache.kafka.streams.StreamsConfig;
-import org.apache.kafka.streams.Topology;
-import org.apache.kafka.streams.TopologyTestDriver;
+import org.apache.kafka.streams.TopologyConfig;
+import org.apache.kafka.streams.TopologyWrapper;
 import org.apache.kafka.streams.errors.TaskCorruptedException;
+import org.apache.kafka.streams.internals.StreamsConfigUtils;
+import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.api.Processor;
 import org.apache.kafka.streams.processor.api.Record;
+import org.apache.kafka.streams.processor.internals.ProcessorContextImpl;
+import org.apache.kafka.streams.processor.internals.ProcessorStateManager;
+import org.apache.kafka.streams.processor.internals.ProcessorTopology;
+import org.apache.kafka.streams.processor.internals.StateDirectory;
+import org.apache.kafka.streams.processor.internals.StreamTask;
+import org.apache.kafka.streams.processor.internals.Task;
+import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
 import org.apache.kafka.streams.state.StoreBuilder;
 import org.apache.kafka.streams.state.Stores;
+import org.apache.kafka.test.MockRecordCollector;
 import org.apache.kafka.test.TestUtils;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.io.File;
 import java.time.Duration;
 import java.util.Properties;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-// TopologyTestDriver#close deletes the state, so the empty directory a never-written store leaves is made by hand
+// The empty directory a never-written store leaves is made by hand. The task is built directly rather than by
+// TopologyTestDriver, whose constructor would leave the stores open when the task fails to initialize.
 public class SegmentedStoreWithoutSegmentsTest {
 
     private static final String APPLICATION_ID = "segmented-store-without-segments";
     private static final String STORE_NAME = "never-written";
+    private static final TaskId TASK_ID = new TaskId(0, 0);
     private static final Duration RETENTION = Duration.ofDays(2);
     private static final Duration WINDOW_SIZE = Duration.ofDays(1);
+
+    private StreamTask task;
 
     private enum StoreType {
         WINDOW,
@@ -105,12 +127,49 @@ public class SegmentedStoreWithoutSegmentsTest {
         }
     }
 
-    private static Topology topology(final StoreType storeType) {
-        final Topology topology = new Topology();
+    private static ProcessorTopology topology(final StoreType storeType) {
+        final TopologyWrapper topology = new TopologyWrapper();
         topology.addSource("source", new StringDeserializer(), new StringDeserializer(), "input");
         topology.addProcessor("processor", NoOpProcessor::new, "source");
         topology.addStateStore(storeBuilder(storeType), "processor");
-        return topology;
+        return topology.getInternalBuilder(APPLICATION_ID).buildTopology();
+    }
+
+    private static StreamTask createTask(final StoreType storeType, final File stateDir) {
+        final StreamsConfig config = new StreamsConfig(exactlyOnce(stateDir));
+        final ProcessorTopology topology = topology(storeType);
+        final Set<TopicPartition> inputPartitions = Set.of(new TopicPartition("input", 0));
+        final LogContext logContext = new LogContext();
+        final MockTime time = new MockTime();
+        final StreamsMetricsImpl metrics = new StreamsMetricsImpl(new Metrics(), "test-client", time);
+        final ThreadCache cache = new ThreadCache(logContext, 0, metrics);
+        final StateDirectory stateDirectory = new StateDirectory(config, time, true, false);
+        final ProcessorStateManager stateManager = new ProcessorStateManager(
+            TASK_ID,
+            Task.TaskType.ACTIVE,
+            StreamsConfigUtils.eosEnabled(config),
+            config.getBoolean(StreamsConfig.TRANSACTIONAL_STATE_STORES_CONFIG),
+            logContext,
+            stateDirectory,
+            time,
+            topology.storeToChangelogTopic(),
+            inputPartitions);
+
+        return new StreamTask(
+            TASK_ID,
+            inputPartitions,
+            topology,
+            new MockConsumer<>(AutoOffsetResetStrategy.EARLIEST.name()),
+            new TopologyConfig(null, config, new Properties()).getTaskConfig(),
+            metrics,
+            stateDirectory,
+            cache,
+            time,
+            stateManager,
+            new MockRecordCollector(),
+            new ProcessorContextImpl(TASK_ID, config, stateManager, metrics, cache),
+            logContext,
+            false);
     }
 
     private static Properties exactlyOnce(final File stateDir) {
@@ -122,9 +181,16 @@ public class SegmentedStoreWithoutSegmentsTest {
         return props;
     }
 
-    // the only task of the TopologyTestDriver is 0_0
     private static File storeDir(final File stateDir) {
-        return new File(stateDir, APPLICATION_ID + File.separator + "0_0" + File.separator + STORE_NAME);
+        return new File(stateDir, APPLICATION_ID + File.separator + TASK_ID + File.separator + STORE_NAME);
+    }
+
+    @AfterEach
+    public void closeTask() {
+        if (task != null) {
+            task.suspend();
+            task.closeDirty();
+        }
     }
 
     @ParameterizedTest
@@ -133,7 +199,8 @@ public class SegmentedStoreWithoutSegmentsTest {
         final File stateDir = TestUtils.tempDirectory();
         assertTrue(storeDir(stateDir).mkdirs());
 
-        assertDoesNotThrow(() -> new TopologyTestDriver(topology(storeType), exactlyOnce(stateDir)).close());
+        task = createTask(storeType, stateDir);
+        assertDoesNotThrow(task::initializeIfNeeded);
     }
 
     // a segment that holds no offset may hold uncommitted writes
@@ -143,8 +210,7 @@ public class SegmentedStoreWithoutSegmentsTest {
         final File stateDir = TestUtils.tempDirectory();
         assertTrue(new File(storeDir(stateDir), STORE_NAME + ".0").mkdirs());
 
-        assertThrows(
-            TaskCorruptedException.class,
-            () -> new TopologyTestDriver(topology(storeType), exactlyOnce(stateDir)).close());
+        task = createTask(storeType, stateDir);
+        assertThrows(TaskCorruptedException.class, task::initializeIfNeeded);
     }
 }
